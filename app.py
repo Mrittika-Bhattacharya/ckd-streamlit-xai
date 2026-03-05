@@ -65,13 +65,53 @@ def get_shap_explainer():
 explainer = get_shap_explainer()
 
 def transform_input(df_raw: pd.DataFrame) -> np.ndarray:
-    # Drop columns that should not be learned
+    # ---- Clean column names ----
+    df_raw = df_raw.copy()
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+
+    # Remove common junk columns from CSV export
+    for junk in ["Unnamed: 0", "index", "Index"]:
+        if junk in df_raw.columns:
+            df_raw = df_raw.drop(columns=[junk])
+
+    # Drop columns that shouldn't be learned
     drop_cols = []
     if "DoctorInCharge" in df_raw.columns:
         drop_cols.append("DoctorInCharge")
     if "Diagnosis" in df_raw.columns:
         df_raw = df_raw.drop(columns=["Diagnosis"])
 
+    # ---- Check schema expected by preprocess ----
+    # ColumnTransformer fitted on a pandas DataFrame usually stores expected input columns here:
+    if hasattr(preprocess, "feature_names_in_"):
+        required = list(preprocess.feature_names_in_)
+    else:
+        # fallback (less ideal): assume current columns are correct
+        required = list(df_raw.columns)
+
+    missing = sorted(list(set(required) - set(df_raw.columns)))
+
+    if missing:
+        st.error("❌ Uploaded CSV does not match the expected input schema.")
+        st.write("### Missing required columns:")
+        st.write(missing)
+
+        st.write("### Expected columns (template):")
+        st.write(required)
+
+        st.write("### Your uploaded columns:")
+        st.write(list(df_raw.columns))
+
+        st.info(
+            "Upload a RAW patient CSV like `demo_patients_raw_val.csv` from your notebook "
+            "(contains all features). Prediction-export files will NOT work."
+        )
+        st.stop()
+
+    # ---- Reorder columns to match training-time order ----
+    df_raw = df_raw[required]
+
+    # Transform
     X = preprocess.transform(df_raw.drop(columns=drop_cols, errors="ignore"))
     return X
 
