@@ -1,4 +1,3 @@
-
 import os
 import json
 import numpy as np
@@ -22,7 +21,6 @@ def load_artifacts():
         thr_info = json.load(f)
     final_thr = float(thr_info["final_threshold"])
     X_bg = np.load("shap_background.npy")
-
     return model, preprocess, final_thr, X_bg
 
 final_model, preprocess, FINAL_THR, X_bg = load_artifacts()
@@ -82,11 +80,9 @@ def transform_input(df_raw: pd.DataFrame) -> np.ndarray:
         df_raw = df_raw.drop(columns=["Diagnosis"])
 
     # ---- Check schema expected by preprocess ----
-    # ColumnTransformer fitted on a pandas DataFrame usually stores expected input columns here:
     if hasattr(preprocess, "feature_names_in_"):
         required = list(preprocess.feature_names_in_)
     else:
-        # fallback (less ideal): assume current columns are correct
         required = list(df_raw.columns)
 
     missing = sorted(list(set(required) - set(df_raw.columns)))
@@ -120,29 +116,45 @@ def predict_proba_and_label(X: np.ndarray):
     pred = (proba_ckd >= FINAL_THR).astype(int)
     return proba_ckd, pred
 
-def group_shap_by_original_feature(shap_vals_row: np.ndarray, feature_names: np.ndarray):
+# ✅ UPDATED (robust) SHAP grouping function
+def group_shap_by_original_feature(shap_vals_row, feature_names: np.ndarray):
     """
-    Streamlit-friendly: group one-hot encoded features back to original feature names.
-    feature_names look like: "num__Age", "cat__Ethnicity_3", etc.
-    We'll group:
-      - num__Age -> Age
-      - cat__Ethnicity_3 -> Ethnicity
+    Group one-hot encoded SHAP features back to original feature names.
+    Also makes SHAP row strictly 1D float vector (fixes Streamlit TypeError).
     """
+
+    # --- Make shap_vals_row a clean 1D float array ---
+    sv = np.array(shap_vals_row)
+
+    # Cases:
+    # (p,)          -> ok
+    # (p,1)         -> squeeze
+    # (p,2)         -> take class-1 column
+    # (1,p)         -> squeeze
+    if sv.ndim == 2 and sv.shape[0] == 1:
+        sv = sv[0]
+    if sv.ndim == 2 and sv.shape[1] == 1:
+        sv = sv[:, 0]
+    if sv.ndim == 2 and sv.shape[1] == 2:
+        sv = sv[:, 1]   # class-1 contributions
+    sv = sv.astype(float).ravel()
+
+    # --- Grouping ---
     groups = {}
-    for val, name in zip(shap_vals_row, feature_names):
+
+    for val, name in zip(sv, feature_names):
         name = str(name)
+
         if name.startswith("num__"):
             base = name.replace("num__", "")
         elif name.startswith("cat__"):
             raw = name.replace("cat__", "")
-            # take part before first "_" as original categorical column
             base = raw.split("_")[0] if "_" in raw else raw
         else:
             base = name
 
         groups[base] = groups.get(base, 0.0) + float(val)
 
-    # return sorted dataframe
     df_g = pd.DataFrame({"feature": list(groups.keys()), "shap_sum": list(groups.values())})
     df_g["abs"] = df_g["shap_sum"].abs()
     df_g = df_g.sort_values("abs", ascending=False).drop(columns=["abs"]).reset_index(drop=True)
@@ -189,7 +201,13 @@ st.dataframe(out)
 
 # Choose one row for explanation
 st.subheader("Explainability (SHAP) for a selected prediction")
-row_idx = st.number_input("Select row index to explain", min_value=0, max_value=len(out)-1, value=0, step=1)
+row_idx = st.number_input(
+    "Select row index to explain",
+    min_value=0,
+    max_value=len(out) - 1,
+    value=0,
+    step=1
+)
 
 risk = float(out.loc[row_idx, "ckd_risk_proba"])
 label = int(out.loc[row_idx, "ckd_pred_label"])
@@ -201,13 +219,17 @@ col3.metric("Decision", "CKD (High Risk)" if label == 1 else "Non-CKD (Lower Ris
 
 # Compute SHAP for that one row
 feature_names = np.array(preprocess.get_feature_names_out(), dtype=object)
-sv = explainer.shap_values(X[row_idx:row_idx+1])
+sv = explainer.shap_values(X[row_idx:row_idx + 1])
 
 # binary trees often return [class0, class1]
 if isinstance(sv, list) and len(sv) == 2:
     sv_row = sv[1][0]  # class-1 contributions
 else:
     sv_row = np.array(sv)[0]
+
+# ✅ DEBUG SAFE lines (shapes only)
+st.write("SHAP row shape:", np.array(sv_row).shape)
+st.write("Feature count:", len(feature_names))
 
 df_g = group_shap_by_original_feature(sv_row, feature_names)
 
@@ -228,4 +250,7 @@ with cB:
 fig = plot_bar(df_g, title="Top SHAP contributions (grouped to original features)")
 st.pyplot(fig)
 
-st.caption("Note: SHAP shows which features pushed the model toward CKD vs Non-CKD for this specific patient, based on the Random Forest base estimator.")
+st.caption(
+    "Note: SHAP shows which features pushed the model toward CKD vs Non-CKD for this specific patient, "
+    "based on the Random Forest base estimator."
+)
